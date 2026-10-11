@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thsgui-trader"
+version = "0.1.0"
+description = "Read-only macOS Accessibility gateway for the Tonghuashun trading client"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.111,<1",
+  "uvicorn>=0.30,<1",
+  "pydantic>=2,<3",
+  "pyobjc-framework-AppKit>=10,<11",
+  "pyobjc-framework-Quartz>=10,<11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+thsgui-trader = "thsgui_trader.main:run"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
