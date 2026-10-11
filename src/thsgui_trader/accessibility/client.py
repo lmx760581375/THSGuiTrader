@@ -85,6 +85,10 @@ class _NativeLibraries:
         cf.CFArrayGetCount.restype = ctypes.c_long
         cf.CFArrayGetValueAtIndex.argtypes = [_PTR, ctypes.c_long]
         cf.CFArrayGetValueAtIndex.restype = _PTR
+        cf.CFArrayCreate.argtypes = [
+            _PTR, ctypes.POINTER(_PTR), ctypes.c_long, _PTR
+        ]
+        cf.CFArrayCreate.restype = _PTR
         cf.CFNumberGetValue.argtypes = [_PTR, ctypes.c_int, _PTR]
         cf.CFNumberGetValue.restype = ctypes.c_bool
         cf.CFBooleanGetValue.argtypes = [_PTR]
@@ -318,6 +322,33 @@ class MacAccessibilityClient:
         if not node.ref:
             return False
         return bool(self._copy_attribute(node.ref, "AXSelected"))
+
+    def clear_selected_rows(self, table: AXNode) -> None:
+        """Clear a table's native selection set, including stale hidden rows."""
+        if not table.ref:
+            raise AccessibilityUnavailable("Accessibility table has no native reference")
+        empty = _CORE_FOUNDATION.CFArrayCreate(None, None, 0, None)
+        if not empty:
+            raise AccessibilityUnavailable("unable to create an empty selection set")
+        try:
+            error = _LIBS.application_services.AXUIElementSetAttributeValue(
+                _PTR(table.ref), self._attribute_key("AXSelectedRows"), empty
+            )
+        finally:
+            _CORE_FOUNDATION.CFRelease(empty)
+        if error != 0:
+            raise AccessibilityUnavailable(f"Accessibility selection reset failed: {error}")
+
+    def selected_row_count(self, table: AXNode) -> int:
+        """Return table-level selection count without rebuilding the tree."""
+        if not table.ref:
+            return 0
+        refs = self._copy_array_attribute(table.ref, "AXSelectedRows")
+        try:
+            return len(refs)
+        finally:
+            for ref in refs:
+                _CORE_FOUNDATION.CFRelease(_PTR(ref))
 
     def set_value(self, node: AXNode, value: str) -> None:
         """Set a writable AXValue; never falls back to coordinate or keyboard input."""

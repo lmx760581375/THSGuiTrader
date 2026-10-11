@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thsgui-trader"
 version = "0.1.0"
-description = "Read-only macOS Accessibility gateway for the Tonghuashun trading client"
+description = "macOS Accessibility gateway for the Tonghuashun trading client"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.111,<1",

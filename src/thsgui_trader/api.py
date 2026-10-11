@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from threading import RLock
 from time import perf_counter
 from fastapi import FastAPI, HTTPException, Query
 
@@ -17,11 +18,13 @@ from .models import (
 def create_app(gateway: TonghuashunGuiGateway | None = None) -> FastAPI:
     app = FastAPI(title="THSGUI Trader", version="0.1.0", docs_url="/docs")
     service = gateway or TonghuashunGuiGateway(Settings.from_env())
+    gui_lock = RLock()
 
     def read(call):
         started = perf_counter()
         try:
-            result = call()
+            with gui_lock:
+                result = call()
             return {
                 "data": result,
                 "fetched_at": datetime.now(),
@@ -33,7 +36,8 @@ def create_app(gateway: TonghuashunGuiGateway | None = None) -> FastAPI:
     @app.get("/health")
     def health():
         started = perf_counter()
-        status = service.get_connection_status()
+        with gui_lock:
+            status = service.get_connection_status()
         return {
             "ok": status.connected,
             "connection": status,
@@ -43,7 +47,8 @@ def create_app(gateway: TonghuashunGuiGateway | None = None) -> FastAPI:
     @app.get("/api/v1/connection")
     def connection():
         started = perf_counter()
-        status = service.get_connection_status()
+        with gui_lock:
+            status = service.get_connection_status()
         result = status.model_dump(mode="json")
         result["timings_ms"] = {"total": round((perf_counter() - started) * 1000)}
         return result

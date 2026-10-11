@@ -153,6 +153,8 @@ class OrderExecuteRequest(ApiModel):
     def validate_intent(self) -> "OrderExecuteRequest":
         if (self.amount is None) == (self.quantity is None):
             raise ValueError("exactly one of amount or quantity is required")
+        if self.quantity is not None and self.quantity % 100 != 0:
+            raise ValueError("quantity must be a multiple of 100")
         if self.side == "buy" and self.min_price is not None:
             raise ValueError("min_price is only valid for sell orders")
         if self.side == "sell" and self.max_price is not None:

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from ..accessibility import AXNode, MacAccessibilityClient
 from ..config import Settings
-from ..errors import DataValidationError, GatewayError
+from ..errors import AccessibilityUnavailable, DataValidationError, GatewayError
 from ..models import (
     AccountFunds, CancelBatchPreview, CancelBatchSubmitResult, CancelPreview,
     CancelSubmitResult, CancelTimings, ConnectionStatus, FundDetail,
@@ -21,7 +21,6 @@ from ..parsers import (
     parse_positions, parse_trades,
 )
 
-
 class TonghuashunGuiGateway:
     """Tonghuashun adapter backed by macOS Accessibility.
 
@@ -31,6 +30,11 @@ class TonghuashunGuiGateway:
 
     _TABS = ("\u6301\u4ed3", "\u59d4\u6258", "\u6210\u4ea4", "\u8d44\u91d1\u660e\u7ec6")
     _BOARDS = ("A\u80a1", "\u6a21\u62df")
+    # The board switch is asynchronous. 0.45s is the shortest stable value
+    # observed across A股 and 模拟; the following form snapshot remains the
+    # authoritative readiness check.
+    _BOARD_SETTLE_SECONDS = 0.45
+    _TAB_SETTLE_SECONDS = 0.12
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings.from_env()
@@ -44,6 +48,9 @@ class TonghuashunGuiGateway:
         # The client does not expose a reliable selected-state attribute for
         # the board buttons, so keep the last board selected by this gateway.
         self._board: str | None = None
+        # Identity metadata is used only to reject a stale quote after a
+        # failed transition. No quote prices or quantities are cached.
+        self._last_quote_identity: tuple[str, str] | None = None
 
     def _snapshot(self) -> AXNode:
         return self.client.snapshot()
@@ -72,13 +79,15 @@ class TonghuashunGuiGateway:
                 self.client.press(button)
         finally:
             root.release()
-        time.sleep(0.25)
+        time.sleep(self._TAB_SETTLE_SECONDS)
         return self._snapshot()
 
-    def _select_board(self, board: str = "A\u80a1") -> None:
+    def _select_board(self, board: str = "A\u80a1", *, force: bool = True) -> None:
         """Select the board used for quote reads and order operations."""
         if board not in self._BOARDS:
             raise DataValidationError(f"unsupported board: {board}")
+        if not force and self._board == board:
+            return
         root = self._snapshot()
         try:
             button = self._find_button(root, board)
@@ -91,7 +100,7 @@ class TonghuashunGuiGateway:
             self.client.press(button)
         finally:
             root.release()
-        time.sleep(0.6)
+        time.sleep(self._BOARD_SETTLE_SECONDS)
         self._board = board
 
     @staticmethod
@@ -131,11 +140,58 @@ class TonghuashunGuiGateway:
         return None
 
     @staticmethod
+    def _displayed_security_name(root: AXNode) -> str:
+        """Read the security name paired with the trade form's code label."""
+        nodes = list(root.walk())
+        for index, node in enumerate(nodes):
+            if node.role not in {"AXStaticText", "AXText", "AXLabel"}:
+                continue
+            if node.text().strip() != "代码":
+                continue
+            if index + 1 >= len(nodes):
+                return ""
+            candidate = nodes[index + 1]
+            text = candidate.text().strip()
+            if (
+                candidate.role in {"AXStaticText", "AXText", "AXLabel"}
+                and text not in {"", "价格", "数量"}
+            ):
+                return text
+            return ""
+        return ""
+
+    @classmethod
+    def _quote_identity_matches(
+        cls,
+        root: AXNode,
+        symbol: str,
+        previous_code: str,
+        previous_name: str,
+    ) -> bool:
+        code = cls._form_field(root, "代码")
+        current_name = cls._displayed_security_name(root)
+        if code is None or code.text().strip() != symbol or not current_name:
+            return False
+        return not (
+            previous_code
+            and previous_code != symbol
+            and previous_name
+            and current_name == previous_name
+        )
+
+    @staticmethod
     def _normalise_number(value: str) -> float | None:
         try:
             return float(value.replace(",", "").strip())
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _order_book_complete(book: OrderBook) -> bool:
+        return len(book.levels) >= 10 and all(
+            level.price is not None and level.quantity is not None
+            for level in book.levels
+        )
 
     def _live_text(self, node: AXNode) -> str:
         for attribute in ("AXValue", "AXTitle", "AXDescription"):
@@ -144,8 +200,15 @@ class TonghuashunGuiGateway:
                 return str(value).strip()
         return ""
 
-    def _wait_live_value(self, node: AXNode, expected: str, *, numeric: bool = False) -> None:
-        deadline = time.monotonic() + 1.5
+    def _wait_live_value(
+        self,
+        node: AXNode,
+        expected: str,
+        *,
+        numeric: bool = False,
+        timeout: float = 1.5,
+    ) -> None:
+        deadline = time.monotonic() + timeout
         expected_number = self._normalise_number(expected) if numeric else None
         while time.monotonic() < deadline:
             actual = self._live_text(node)
@@ -168,12 +231,31 @@ class TonghuashunGuiGateway:
     def _write_live_field(
         self, field: AXNode, label: str, value: str, *, numeric: bool = False
     ) -> None:
-        self.client.type_text(field, value)
-        if "AXConfirm" in self.client.action_names(field):
-            self.client.perform_action(field, "AXConfirm")
         if label == "代码":
+            # AXValue + AXConfirm can change the displayed code without
+            # firing Tonghuashun's quote refresh handler. A real text-change
+            # keyboard event followed by focus loss is required for codes.
+            self.client.set_value(field, "")
+            self._wait_live_value(field, "", timeout=0.5)
+            self.client.type_text(field, value)
+            self._wait_live_value(field, value)
+            if "AXConfirm" in self.client.action_names(field):
+                self.client.perform_action(field, "AXConfirm")
             self.client.press_tab()
-        self._wait_live_value(field, value, numeric=numeric)
+            return
+
+        # Native AXValue avoids the intermittent focus/paste loss seen after
+        # several consecutive submissions for price and quantity. Retain the
+        # keyboard path only for client versions that reject writable AXValue.
+        try:
+            self.client.set_value(field, value)
+            self._wait_live_value(field, value, numeric=numeric, timeout=0.5)
+        except (AccessibilityUnavailable, DataValidationError):
+            self.client.type_text(field, value)
+            self._wait_live_value(field, value, numeric=numeric)
+        actions = self.client.action_names(field)
+        if "AXConfirm" in actions:
+            self.client.perform_action(field, "AXConfirm")
 
     @staticmethod
     def _quote_price_buttons(root: AXNode, candidates: set[str]) -> list[AXNode]:
@@ -195,6 +277,7 @@ class TonghuashunGuiGateway:
             if field is None:
                 raise DataValidationError(f"trade form field was not found: {label}")
             self.client.type_text(field, value)
+            self._wait_live_value(field, value, numeric=numeric)
             if "AXConfirm" in self.client.action_names(field):
                 self.client.perform_action(field, "AXConfirm")
             if label == "\u4ee3\u7801":
@@ -307,88 +390,156 @@ class TonghuashunGuiGateway:
         self._set_form_field("\u4ee3\u7801", symbol)
         time.sleep(0.45)
 
-    def _set_symbol_fast(self, symbol: str) -> OrderBook:
-        """Refresh a symbol using one form snapshot and live AX reads."""
+    def _select_trade_side(self, side: str) -> None:
+        """Put the trade form in the requested direction before writing it."""
+        label = "买入" if side == "buy" else "卖出"
+        confirm_label = "确定买入" if side == "buy" else "确定卖出"
         root = self._snapshot()
         try:
-            quantity = self._form_field(root, "数量")
-            if quantity is not None and self._live_text(quantity) not in {"", "0"}:
-                self._write_live_field(quantity, "数量", "0", numeric=True)
-            code = self._form_field(root, "代码")
-            if code is None:
-                raise DataValidationError("trade form field was not found: 代码")
-            self._write_live_field(code, "代码", symbol)
+            if self._button(root, confirm_label) is not None:
+                return
+            toggle = self._button(root, label)
+            if toggle is None:
+                raise DataValidationError(f"trade side button is unavailable: {side}")
+            self.client.press(toggle)
         finally:
             root.release()
 
-        # A short initial wait handles the normal path. A single retry keeps
-        # the quote read accurate without returning to repeated fixed sleeps.
-        time.sleep(0.25)
-        last_error: DataValidationError | None = None
-        for attempt in range(2):
-            root = self._snapshot()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            check = self._snapshot()
             try:
-                return parse_order_book(root, symbol, now=datetime.now())
-            except DataValidationError as exc:
-                last_error = exc
+                if self._button(check, confirm_label) is not None:
+                    return
             finally:
-                root.release()
-            if attempt == 0:
-                time.sleep(0.15)
-        raise last_error or DataValidationError("order book was not refreshed")
+                check.release()
+            time.sleep(0.05)
+        raise DataValidationError(f"trade form did not switch to side: {side}")
+
+    def _set_symbol_fast(self, symbol: str) -> OrderBook:
+        """Refresh a symbol and prove quote ownership before returning prices."""
+        last_error: DataValidationError | None = None
+        for refresh_attempt in range(2):
+            root: AXNode | None = None
+            try:
+                root = self._snapshot()
+                quantity = self._form_field(root, "数量")
+                code = self._form_field(root, "代码")
+                if quantity is None or code is None:
+                    raise DataValidationError("trade form fields are not fully exposed")
+                previous_code = code.text().strip()
+                previous_name = self._displayed_security_name(root)
+                if (
+                    self._last_quote_identity is not None
+                    and self._last_quote_identity[0] != symbol
+                ):
+                    previous_code, previous_name = self._last_quote_identity
+                if quantity.text().strip() not in {"", "0"}:
+                    self._write_live_field(quantity, "数量", "0", numeric=True)
+                self._write_live_field(code, "代码", symbol)
+            except (DataValidationError, AccessibilityUnavailable):
+                if refresh_attempt == 1:
+                    raise
+                continue
+            finally:
+                if root is not None:
+                    root.release()
+
+            # A retained quote table can stay alive and complete while still
+            # containing the previous symbol's prices. Full-window reads are
+            # required, and a cross-symbol transition must change the name.
+            deadline = time.monotonic() + 3.5
+            while time.monotonic() < deadline:
+                check: AXNode | None = None
+                try:
+                    check = self._snapshot()
+                    identity_ready = self._quote_identity_matches(
+                        check, symbol, previous_code, previous_name
+                    )
+                    book = parse_order_book(check, symbol, now=datetime.now())
+                    if identity_ready and self._order_book_complete(book):
+                        self._last_quote_identity = (
+                            symbol, self._displayed_security_name(check)
+                        )
+                        return book
+                except DataValidationError as exc:
+                    last_error = exc
+                finally:
+                    if check is not None:
+                        check.release()
+                time.sleep(0.05)
+        raise last_error or DataValidationError(
+            f"order book did not finish switching to symbol {symbol}"
+        )
 
     def _set_trade_form(self, symbol: str, price: float, quantity: int, side: str) -> None:
+        self._select_trade_side(side)
         self._set_symbol(symbol)
-        self._fill_trade_form(price, quantity, side)
+        self._fill_trade_form(price, quantity)
 
-    def _fill_trade_form(self, price: float, quantity: int, side: str) -> None:
+    def _fill_trade_form(self, price: float, quantity: int) -> None:
         """Fill a form whose symbol and quote page were already refreshed."""
         self._set_price(price)
         self._set_form_field("\u6570\u91cf", str(quantity), numeric=True)
+
+    def _fill_trade_form_fast(self, preview: OrderPreview) -> None:
+        """Fill and submit using a fresh form snapshot plus live field reads."""
         root = self._snapshot()
         try:
-            button = self._button(root, "买入" if side == "buy" else "卖出")
-            if button is None:
-                raise DataValidationError(f"trade side button is unavailable: {side}")
-            self.client.press(button)
-        finally:
-            root.release()
-        time.sleep(0.35)
-
-    def _fill_trade_form_fast(self, preview: OrderPreview) -> bool:
-        """Fill and submit using one form snapshot plus live field reads.
-
-        Returns whether the first ``确定买入/确定卖出`` button was also found
-        and pressed from that same snapshot.
-        """
-        root = self._snapshot()
-        try:
-            price_field = self._form_field(root, "价格")
-            quantity_field = self._form_field(root, "数量")
-            if price_field is None or quantity_field is None:
-                self._fill_trade_form(
-                    preview.price, preview.quantity, preview.side
-                )
-                return False
-            self._write_live_field(price_field, "价格", f"{preview.price:.3f}", numeric=True)
-            self._write_live_field(quantity_field, "数量", str(preview.quantity), numeric=True)
+            price = self._form_field(root, "价格")
+            quantity = self._form_field(root, "数量")
             button = self._button(
-                root, "买入" if preview.side == "buy" else "卖出"
+                root, "确定买入" if preview.side == "buy" else "确定卖出"
             )
-            if button is None:
-                raise DataValidationError(f"trade side button is unavailable: {preview.side}")
+            if price is None or quantity is None or button is None:
+                raise DataValidationError("trade form controls are not fully exposed")
+            self._write_live_field(price, "价格", f"{preview.price:.3f}", numeric=True)
+            self._write_live_field(quantity, "数量", str(preview.quantity), numeric=True)
             self.client.press(button)
-            time.sleep(0.15)
-            submit_button = self._button(
-                root,
-                "确定买入" if preview.side == "buy" else "确定卖出",
-            )
-            if submit_button is None:
-                return False
-            self.client.press(submit_button)
-            return True
         finally:
             root.release()
+
+    @staticmethod
+    def _latest_matching_order(matches: list[Order]) -> list[Order]:
+        if not matches:
+            return []
+
+        def key(order: Order) -> tuple[str, int | str]:
+            order_id = order.order_id or ""
+            try:
+                order_key: int | str = int(order_id)
+            except ValueError:
+                order_key = order_id
+            return (order.order_time or "", order_key)
+
+        return [max(matches, key=key)]
+
+    @classmethod
+    def _matching_submitted_orders(
+        cls,
+        orders: list[Order],
+        preview: OrderPreview,
+        submitted_after: datetime,
+    ) -> list[Order]:
+        recent: list[Order] = []
+        not_before = submitted_after - timedelta(seconds=2)
+        for order in orders:
+            if (
+                order.symbol != preview.symbol
+                or order.quantity != preview.quantity
+                or order.price is None
+                or abs(order.price - preview.price) >= 0.0001
+                or not cls._order_side_matches(order, preview.side)
+                or not order.order_time
+            ):
+                continue
+            try:
+                order_time = datetime.strptime(order.order_time, "%Y%m%d %H:%M:%S")
+            except ValueError:
+                continue
+            if order_time >= not_before:
+                recent.append(order)
+        return cls._latest_matching_order(recent)
 
     def _press_order_confirmation(self, preview: OrderPreview) -> str | None:
         """Press the first submit button and resolve the immediate dialog once."""
@@ -446,12 +597,20 @@ class TonghuashunGuiGateway:
                         if cancel is not None:
                             self.client.press(cancel)
                         raise DataValidationError("order confirmation dialog does not match the preview")
+                    price_values = [
+                        self._normalise_number(token)
+                        for token in text.replace("：", " ").replace(":", " ").split()
+                    ]
+                    price_values.extend(
+                        self._normalise_number(match)
+                        for match in re.findall(
+                            r"(?:当前价格|委托价格|价格)\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)",
+                            text,
+                        )
+                    )
                     price_ok = any(
                         value is not None and abs(value - preview.price) < 0.0001
-                        for value in (
-                            self._normalise_number(token)
-                            for token in text.replace("：", " ").replace(":", " ").split()
-                        )
+                        for value in price_values
                     )
                     if not price_ok:
                         cancel = self._button(root, "取消")
@@ -575,15 +734,10 @@ class TonghuashunGuiGateway:
             root.release()
 
     def get_order_book(self, symbol: str, board: str = "A股") -> OrderBook:
-        if not symbol or not symbol.isdigit():
-            raise DataValidationError("symbol must contain digits only")
+        if not symbol.isdigit() or len(symbol) != 6:
+            raise DataValidationError("symbol must be a six-digit code")
         self._select_board(board)
-        self._set_symbol(symbol)
-        root = self._snapshot()
-        try:
-            return parse_order_book(root, symbol, now=datetime.now())
-        finally:
-            root.release()
+        return self._set_symbol_fast(symbol)
 
     def _account_snapshot(self) -> tuple[ConnectionStatus, AccountFunds, list[Position]]:
         status = self.get_connection_status()
@@ -689,6 +843,7 @@ class TonghuashunGuiGateway:
         self._ensure_order_actions_allowed(preview.account_mode)
 
         self._select_board(preview.account_mode or "A股")
+        submitted_after = datetime.now()
         self._set_trade_form(preview.symbol, preview.price, preview.quantity, preview.side)
         rejection_message = self._press_order_confirmation(preview)
         if rejection_message is not None:
@@ -700,13 +855,9 @@ class TonghuashunGuiGateway:
                 preview=preview,
                 matching_orders=[],
             )
-        matching = [
-            order for order in self.get_orders()
-            if order.symbol == preview.symbol
-            and order.quantity == preview.quantity
-            and order.price is not None
-            and abs(order.price - preview.price) < 0.0001
-        ]
+        matching = self._matching_submitted_orders(
+            self.get_orders(), preview, submitted_after
+        )
         self._order_previews.pop(preview_id, None)
         return OrderSubmitResult(
             accepted=True,
@@ -778,7 +929,8 @@ class TonghuashunGuiGateway:
         if side == "sell":
             # get_positions() switches to its table. Return to the requested
             # trading before locating the code field and refreshing the quote.
-            self._select_board(board)
+            self._select_board(board, force=False)
+        self._select_trade_side(side)
         book = self._set_symbol_fast(symbol)
         quote_refresh = round((perf_counter() - quote_started) * 1000)
 
@@ -806,15 +958,12 @@ class TonghuashunGuiGateway:
         )
         try:
             fill_started = perf_counter()
-            first_submit_pressed = self._fill_trade_form_fast(preview)
+            submitted_after = datetime.now()
+            self._fill_trade_form_fast(preview)
             form_fill = round((perf_counter() - fill_started) * 1000)
 
             confirmation_started = perf_counter()
-            rejection_message = (
-                self._confirm_dialog(preview)
-                if first_submit_pressed
-                else self._press_order_confirmation(preview)
-            )
+            rejection_message = self._confirm_dialog(preview)
             confirmation = round((perf_counter() - confirmation_started) * 1000)
             if rejection_message is not None:
                 result = OrderSubmitResult(
@@ -827,13 +976,9 @@ class TonghuashunGuiGateway:
                 order_refresh = 0
             else:
                 refresh_started = perf_counter()
-                matching = [
-                    order for order in self.get_orders()
-                    if order.symbol == preview.symbol
-                    and order.quantity == preview.quantity
-                    and order.price is not None
-                    and abs(order.price - preview.price) < 0.0001
-                ]
+                matching = self._matching_submitted_orders(
+                    self.get_orders(), preview, submitted_after
+                )
                 order_refresh = round((perf_counter() - refresh_started) * 1000)
                 result = OrderSubmitResult(
                     accepted=True,
@@ -928,7 +1073,29 @@ class TonghuashunGuiGateway:
     def _select_cancel_rows(
         self, root: AXNode, order_ids: list[str], scope: str
     ) -> None:
-        rows = [node for node in root.walk() if node.role == "AXRow"]
+        tables = [node for node in root.walk() if node.role == "AXTable"]
+        order_table = next(
+            (
+                table
+                for table in tables
+                if all(
+                    any(
+                        row.role == "AXRow" and self._contains_text(row, order_id)
+                        for row in table.children
+                    )
+                    for order_id in order_ids
+                )
+            ),
+            None,
+        )
+        if order_table is None:
+            raise DataValidationError("order table is not available for cancellation")
+        # AXSelected=false updates a row's exposed attribute but does not
+        # reliably clear Tonghuashun's internal AXSelectedRows collection.
+        # Reset every table-level collection before invoking a range action.
+        for table in tables:
+            self.client.clear_selected_rows(table)
+        rows = [row for row in order_table.children if row.role == "AXRow"]
         targets = [
             next((row for row in rows if self._contains_text(row, order_id)), None)
             for order_id in order_ids
@@ -936,19 +1103,13 @@ class TonghuashunGuiGateway:
         if any(target is None for target in targets):
             missing = [order_id for order_id, target in zip(order_ids, targets) if target is None]
             raise DataValidationError(f"target order row is no longer visible: {','.join(missing)}")
-        for row in rows:
-            self.client.set_selected(row, False)
-        for target in targets:
-            assert target is not None
-            self.client.select(target)
-        # The client exposes stale AXSelected values after a previous
-        # multi-selection. For a single-order cancel we still require a live
-        # selected flag; batch operations rely on the confirmation dialog's
-        # exact count, which is the only reliable aggregate signal.
-        if len(targets) == 1 and any(
-            not self.client.is_selected(target) for target in targets if target is not None
-        ):
-            raise DataValidationError("target order row could not be selected")
+        # The native table is single-select and the three toolbar actions are
+        # range actions (撤买, 撤卖, 全撤). A row selection cannot scope them to
+        # one order, so only make a best-effort selection for single-order
+        # diagnostics; the confirmation count remains the safety boundary.
+        if len(targets) == 1:
+            assert targets[0] is not None
+            self.client.select(targets[0])
         time.sleep(0.2)
         button_labels = {
             "buy": ("撤买", "全撤买", "撤买全撤"),
@@ -959,6 +1120,12 @@ class TonghuashunGuiGateway:
         if button is None:
             raise DataValidationError(f"cancel button is unavailable: {scope}")
         self.client.press(button)
+
+    def _fresh_orders_root(self) -> AXNode:
+        """Rebuild the order table so stale multi-selection cannot leak."""
+        stale_selection = self._select_tab("持仓")
+        stale_selection.release()
+        return self._select_tab("委托")
 
     def submit_cancel(self, preview_id: str, confirm: bool) -> CancelSubmitResult:
         preview = self._cancel_previews.get(preview_id)
@@ -972,7 +1139,10 @@ class TonghuashunGuiGateway:
         started = perf_counter()
         selection_started = perf_counter()
         self._select_board(preview.account_mode or "A股")
-        root = self._select_tab("委托")
+        # Tonghuashun can keep stale multi-selection state when the same
+        # 委托 tab is revisited. Recreate the table before selecting one row;
+        # the confirmation count remains the final safety check.
+        root = self._fresh_orders_root()
         try:
             if not preview.order.order_id:
                 raise DataValidationError("order preview has no order_id")
@@ -1015,7 +1185,7 @@ class TonghuashunGuiGateway:
         started = perf_counter()
         selection_started = perf_counter()
         self._select_board(preview.account_mode or "A股")
-        root = self._select_tab("委托")
+        root = self._fresh_orders_root()
         try:
             self._select_cancel_rows(
                 root, [order.order_id or "" for order in preview.orders], preview.scope

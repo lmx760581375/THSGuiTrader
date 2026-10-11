@@ -1,4 +1,7 @@
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+import time
 
 from fastapi.testclient import TestClient
 
@@ -81,6 +84,8 @@ def test_read_only_api():
     response = client.get("/api/v1/funds")
     assert response.status_code == 200
     assert response.json()["data"]["total_assets"] == 100.0
+    assert response.json()["timings_ms"]["total"] >= 0
+    assert client.get("/api/v1/connection").json()["timings_ms"]["total"] >= 0
 
 
 def test_execute_api_passes_single_order_intent():
@@ -121,3 +126,28 @@ def test_execute_api_passes_simulated_board_to_gateway():
     })
     assert response.status_code == 200
     assert gateway.last_board == "模拟"
+
+
+def test_api_serializes_gui_calls():
+    class ConcurrentGateway(FakeGateway):
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.state_lock = Lock()
+
+        def get_account_funds(self):
+            with self.state_lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.03)
+            with self.state_lock:
+                self.active -= 1
+            return super().get_account_funds()
+
+    gateway = ConcurrentGateway()
+    client = TestClient(create_app(gateway))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: client.get("/api/v1/funds"), range(2)))
+
+    assert all(response.status_code == 200 for response in responses)
+    assert gateway.max_active == 1
